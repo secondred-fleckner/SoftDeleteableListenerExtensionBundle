@@ -7,6 +7,7 @@ use Doctrine\Common\Annotations\Reader;
 use Doctrine\Common\Proxy\Proxy;
 use Doctrine\Common\Util\ClassUtils;
 use Doctrine\ORM\EntityManager;
+use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Event\LifecycleEventArgs;
 use Doctrine\ORM\Mapping\Annotation;
 use Doctrine\ORM\Mapping\ClassMetadata;
@@ -22,6 +23,11 @@ use Gedmo\Mapping\ExtensionMetadataFactory;
 use Gedmo\SoftDeleteable\SoftDeleteableListener as GedmoSoftDeleteableListener;
 use Symfony\Component\DependencyInjection\ContainerAwareTrait;
 use Symfony\Component\PropertyAccess\PropertyAccess;
+
+use Emdesk\Base\Interfaces\SoftDelete as SoftDeleteEmdesk;
+use Secondred\Base\Interfaces\SoftDelete as SoftDeleteSecondred;
+use Zend\Log\LoggerServiceFactory;
+
 
 /**
  * Soft delete listener class for onSoftDelete behaviour.
@@ -107,6 +113,13 @@ class SoftDeleteListener
                             throw new \Exception(sprintf('%s is not supported for %s relationships', $onDelete->type, get_class($relationship)));
                         }
 
+                        // versionsfilter deaktivieren
+                        $enableFilter = false;
+                        if ($em->getFilters()->isEnabled('ProjectVersionAware')) {
+                            $em->getFilters()->disable('ProjectVersionAware');
+                            $enableFilter = true;
+                        }
+
                         if (($manyToOne || $oneToOne) && $ns && $entity instanceof $ns) {
                             $objects = $em->getRepository($namespace)->findBy(array(
                                 $property->name => $entity,
@@ -134,26 +147,30 @@ class SoftDeleteListener
                                         throw new \Exception(sprintf('No accessor found for %s in %s', $property->name, get_class($mtmRelation)));
                                     }
                                 }
-                            } elseif ($allowMappedSide) {
-                                try {
-                                    $propertyAccessor = PropertyAccess::createPropertyAccessor();
-                                    $collection = $propertyAccessor->getValue($entity, $property->name);
-                                    $collection->clear();
-                                    continue;
-                                } catch (\Exception $e) {
-                                    throw new \Exception(sprintf('No accessor found for %s in %s', $property->name, get_class($entity)));
-                                }
+                            }
+                        } elseif ($allowMappedSide) {
+                            try {
+                                $propertyAccessor = PropertyAccess::createPropertyAccessor();
+                                $collection = $propertyAccessor->getValue($entity, $property->name);
+                                $collection->clear();
+                                continue;
+                            } catch (\Exception $e) {
+                                throw new \Exception(sprintf('No accessor found for %s in %s', $property->name, get_class($entity)));
                             }
                         }
                     }
 
-                    if ($objects) {
-                        $reflectionClass = new \ReflectionClass($namespace);
-                        $classAnnotation = $this->reader->getClassAnnotation($reflectionClass, \Gedmo\Mapping\Annotation\SoftDeleteable::class);
-                        $softDelete = $classAnnotation instanceof \Gedmo\Mapping\Annotation\SoftDeleteable;
-                        foreach ($objects as $object) {
-                            $this->processOnDeleteOperation($object, $onDelete, $property, $meta, $softDelete, $args, ['fieldName' => $classAnnotation->fieldName]);
-                        }
+                    if ($enableFilter) {
+                        $em->getFilters()->enable('ProjectVersionAware');
+                    }
+                }
+
+                if ($objects) {
+                    $reflectionClass = new \ReflectionClass($namespace);
+                    $classAnnotation = $this->reader->getClassAnnotation($reflectionClass, \Gedmo\Mapping\Annotation\SoftDeleteable::class);
+                    $softDelete = $classAnnotation instanceof \Gedmo\Mapping\Annotation\SoftDeleteable;
+                    foreach ($objects as $object) {
+                        $this->processOnDeleteOperation($object, $onDelete, $property, $meta, $softDelete, $args, ['fieldName' => $classAnnotation->fieldName]);
                     }
                 }
             }
@@ -291,6 +308,12 @@ class SoftDeleteListener
         LifecycleEventArgs $args,
         $config
     ) {
+        if ($object instanceof SoftDeleteEmdesk || $object instanceof SoftDeleteSecondred) {
+            $softDelete = true;
+        } else {
+            $softDelete = false;
+        }
+
         if ($softDelete) {
             $this->softDeleteCascade($args->getEntityManager(), $config, $object);
         } else {
@@ -301,10 +324,14 @@ class SoftDeleteListener
     /**
      * @param EntityManager $em
      * @param $config
-     * @param $object
+     * @param SoftDeleteEmdesk|SoftDeleteSecondred $object
      */
     protected function softDeleteCascade($em, $config, $object)
     {
+        if ($object->isDeleted()) {
+            return;
+        }
+
         $meta = $em->getClassMetadata(get_class($object));
         $reflProp = $meta->getReflectionProperty($config['fieldName']);
         $oldValue = $reflProp->getValue($object);
